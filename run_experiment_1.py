@@ -233,7 +233,8 @@ def task_loss(logits: torch.Tensor, yb: torch.Tensor, classes: list[int] | None,
 
 def train_one_task(model, loader, device, lr, epochs, classes,
                    freeze_direction=False, gain_lr=None, log_prefix="      ",
-                   shared_head: bool = False, per_layer_dir_lrs: list[float] | None = None):
+                   shared_head: bool = False, per_layer_dir_lrs: list[float] | None = None,
+                   epoch_hook=None):
     """Train `model` for one task.
 
     - freeze_direction=True: only gains (+ bias) are optimized; direction frozen.
@@ -243,6 +244,8 @@ def train_one_task(model, loader, device, lr, epochs, classes,
       list (one per MDLinear, in order). This is SAND's per-layer drift: a layer
       whose gradient probe said 'move a lot' gets a high lr, a layer that's happy
       gets a low lr. gains still use gain_lr.
+    - epoch_hook: optional callable(epoch_idx, train_loss) called AFTER each epoch,
+      used by the learning-curve recording to capture per-epoch accuracy.
     Otherwise everything is optimized at `lr`.
     """
     gain_params = model.trainable_gain_params()
@@ -305,6 +308,8 @@ def train_one_task(model, loader, device, lr, epochs, classes,
             pbar.close()
         print(f"{log_prefix}epoch {ep+1}/{epochs} done  loss={running/nbatches:.4f}  "
               f"({time.time()-t0:.1f}s)", flush=True)
+        if epoch_hook is not None:
+            epoch_hook(ep, running / nbatches)
     return opt
 
 
@@ -353,6 +358,12 @@ class Result:
     surprises: list[float] = field(default_factory=list)
     # total training epochs spent per task (for compute-fairness auditing)
     total_epochs_per_task: int = 0
+    # per-epoch learning curves for the 'learning over time' plot:
+    #   curves[task_idx] = list of (epoch_idx, new_task_acc, old_tasks_acc)
+    # where new_task_acc is accuracy on the task being trained and
+    # old_tasks_acc is the mean accuracy on all previously-learned tasks,
+    # both evaluated AFTER that epoch. (task 0 has no old tasks -> old=NaN.)
+    curves: list[list[tuple[int, float, float]]] = field(default_factory=list)
 
     def final_avg_accuracy(self) -> float:
         last = self.acc_matrix[-1]
@@ -369,6 +380,44 @@ class Result:
         return sum(forgets) / len(forgets)
 
 
+def _make_curve_hook(model, new_task, old_tasks, res, t: int, device):
+    """Build an epoch_hook that records, after each training epoch of task t:
+    (epoch_idx, new_task_acc, old_tasks_mean_acc) into res.curves[t].
+    new_task_acc = accuracy on the task being trained; old_tasks_mean_acc =
+    mean accuracy on all previously-learned tasks (NaN if none). This drives
+    the 'learning over time' plot: how fast each method learns the new task
+    vs how much it forgets the old ones, per epoch."""
+    res.curves.append([])
+    new_loader = make_loader(new_task.test_loader.dataset.tensors[0],
+                             new_task.test_loader.dataset.tensors[1], 512, shuffle=False)
+    old_acc_loaders = [(ot.test_loader.dataset.tensors[0],
+                        ot.test_loader.dataset.tensors[1], ot.classes, ot.shared_head)
+                       for ot in old_tasks]
+    def hook(ep, train_loss):
+        new_acc = evaluate(model, new_loader, device, new_task.classes, new_task.shared_head)
+        if old_acc_loaders:
+            # snapshot the new-task gains, switch to each old task's gains, eval,
+            # then restore -- so 'old tasks' accuracy uses each old task's stored
+            # gains (as in evaluate_all_tasks), not the current task's gains.
+            saved = t  # current task index is t
+            olds = []
+            for oi, (ox, oy, ocl, osh) in enumerate(old_acc_loaders):
+                model.set_task(oi)
+                ol = make_loader(ox, oy, 512, shuffle=False)
+                olds.append(evaluate(model, ol, device, ocl, osh))
+            model.set_task(saved)
+            old_acc = float(np_mean(olds)) if olds else float("nan")
+        else:
+            old_acc = float("nan")
+        res.curves[t].append((ep, new_acc, old_acc))
+    return hook
+
+
+def np_mean(xs):
+    import numpy as _np
+    return float(_np.mean(xs))
+
+
 def run_naive(tasks, device, args) -> Result:
     """Baseline: keep training everything on every task."""
     model = make_model(device, hidden=args.hidden, n_outputs=args.n_outputs)
@@ -376,8 +425,9 @@ def run_naive(tasks, device, args) -> Result:
     for t, task in enumerate(tasks):
         loader = make_loader(task.train_x, task.train_y, args.batch_size, shuffle=True)
         print(f"   --- naive: task {t}/{len(tasks)-1} ({task.name}) ---", flush=True)
+        hook = _make_curve_hook(model, task, tasks[:t], res, t, device)
         train_one_task(model, loader, device, args.lr, args.epochs, task.classes,
-                       log_prefix="      ", shared_head=task.shared_head)
+                       log_prefix="      ", shared_head=task.shared_head, epoch_hook=hook)
         accs = evaluate_all_tasks(model, tasks[:t + 1], device)
         res.acc_matrix.append(accs)
         print(f"   [naive] after task {t}: " +
@@ -401,20 +451,21 @@ def run_fixed_frac(tasks, device, args, frac: float) -> Result:
     for t, task in enumerate(tasks):
         loader = make_loader(task.train_x, task.train_y, args.batch_size, shuffle=True)
         print(f"   --- fixed frac={frac}: task {t}/{len(tasks)-1} ({task.name}) ---", flush=True)
+        hook = _make_curve_hook(model, task, tasks[:t], res, t, device)
         if t == 0:
             train_one_task(model, loader, device, args.lr, args.epochs, task.classes,
-                           log_prefix="      ", shared_head=task.shared_head)
+                           log_prefix="      ", shared_head=task.shared_head, epoch_hook=hook)
         else:
             model.new_task()
             if frac == 0:
                 model.freeze_direction()
                 train_one_task(model, loader, device, args.lr, args.epochs, task.classes,
                                freeze_direction=True, log_prefix="      ",
-                               shared_head=task.shared_head)
+                               shared_head=task.shared_head, epoch_hook=hook)
             else:
                 train_one_task(model, loader, device, args.lr * frac, args.epochs,
                                task.classes, freeze_direction=False, gain_lr=args.lr,
-                               log_prefix="      ", shared_head=task.shared_head)
+                               log_prefix="      ", shared_head=task.shared_head, epoch_hook=hook)
         accs = evaluate_all_tasks(model, tasks[:t + 1], device)
         res.acc_matrix.append(accs)
         print(f"   [fixed {frac}] after task {t}: " +
@@ -442,9 +493,10 @@ def run_sand(tasks, device, args) -> Result:
         full_loader = make_loader(task.train_x, task.train_y, args.batch_size, shuffle=True)
 
         print(f"   --- SAND: task {t}/{len(tasks)-1} ({task.name}) ---", flush=True)
+        hook = _make_curve_hook(model, task, tasks[:t], res, t, device)
         if t == 0:
             train_one_task(model, full_loader, device, args.lr, args.epochs, task.classes,
-                           log_prefix="      ", shared_head=task.shared_head)
+                           log_prefix="      ", shared_head=task.shared_head, epoch_hook=hook)
         else:
             model.new_task()                       # save old gains, reset live gains
             # ---- COSINE-CONFLICT PROBE (A-GEM / GPM / PCGrad style):
@@ -519,7 +571,7 @@ def run_sand(tasks, device, args) -> Result:
             train_one_task(model, full_loader, device, args.lr, args.epochs, task.classes,
                            freeze_direction=False, gain_lr=args.lr, log_prefix="      ",
                            shared_head=task.shared_head,
-                           per_layer_dir_lrs=per_layer_dir_lrs)
+                           per_layer_dir_lrs=per_layer_dir_lrs, epoch_hook=hook)
         accs = evaluate_all_tasks(model, tasks[:t + 1], device)
         res.acc_matrix.append(accs)
         print(f"   [SAND] after task {t}: " +
@@ -719,6 +771,55 @@ def plot_results(results: list[Result], out_path: str, stream: str) -> None:
     fig.tight_layout(rect=[0, 0.02, 1, 0.95])
     fig.savefig(out_path, dpi=130)
     print(f"\nPlot saved to: {out_path}", flush=True)
+
+    # ---- Learning curves over time: per-epoch new-task acc and old-tasks acc,
+    #      one subplot per task (tasks 1..n-1), methods as colored lines. This
+    #      directly answers 'how fast does each method learn the new task, and
+    #      how much does it forget the old ones, as training progresses?' ---- #
+    n_tasks = max(len(r.acc_matrix) for r in results)
+    n_curve_tasks = n_tasks - 1  # task 0 has no 'old tasks' to forget
+    if n_curve_tasks <= 0 or all(not r.curves for r in results):
+        return
+    cfig, axes = plt.subplots(2, n_curve_tasks, figsize=(4.2 * n_curve_tasks, 7),
+                              squeeze=False)
+    for ti in range(1, n_tasks):  # task 0 is the backbone, skip
+        col = ti - 1
+        ax_new, ax_old = axes[0, col], axes[1, col]
+        for r in results:
+            if ti >= len(r.curves) or not r.curves[ti]:
+                continue
+            rows = r.curves[ti]
+            eps = [row[0] for row in rows]
+            new = [row[1] for row in rows]
+            old = [row[2] for row in rows]
+            is_fan = r.name.startswith("fixed")
+            lw = 2.6 if r.name in ("SAND", "naive", "joint") else 1.1
+            alpha = 0.25 if is_fan else 0.95
+            ax_new.plot(eps, new, marker="o", ms=4, color=r.color, lw=lw,
+                        alpha=alpha, label=r.name)
+            # old-tasks line only where it's not NaN
+            oe = [e for e, o in zip(eps, old) if not (o != o)]  # not NaN
+            oo = [o for o in old if not (o != o)]
+            if oe:
+                ax_old.plot(oe, oo, marker="s", ms=4, color=r.color, lw=lw,
+                            alpha=alpha)
+        ax_new.set_title(f"task {ti} — NEW-task accuracy", fontsize=10)
+        ax_old.set_title(f"task {ti} — OLD-tasks accuracy (forgetting)", fontsize=10)
+        ax_new.set_ylim(0, 1.0); ax_old.set_ylim(0, 1.0)
+        ax_new.set_xlabel("epoch within task"); ax_old.set_xlabel("epoch within task")
+        ax_new.grid(True, alpha=0.3); ax_old.grid(True, alpha=0.3)
+        if col == 0:
+            ax_new.set_ylabel("new-task acc")
+            ax_old.set_ylabel("old-tasks mean acc")
+    axes[0, 0].legend(loc="lower right", fontsize=8, framealpha=0.9)
+    cfig.suptitle(f"SAND \u2014 Learning curves over time ({stream}): "
+                  f"top row = how fast each method learns each NEW task; "
+                  f"bottom row = how much it forgets OLD tasks per epoch",
+                  fontsize=12, fontweight="bold")
+    cfig.tight_layout(rect=[0, 0, 1, 0.95])
+    curves_path = out_path.replace(".png", "-curves.png")
+    cfig.savefig(curves_path, dpi=130)
+    print(f"Plot saved to: {curves_path}", flush=True)
 
 
 # --------------------------------------------------------------------------- #
