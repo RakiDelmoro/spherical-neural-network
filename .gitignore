@@ -1,0 +1,21 @@
+# private planning notes (not for the public repo)
+EXPERIMENTS-PLAN.md
+
+# python caches / bytecode
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# downloaded MNIST data
+data/
+
+# run logs (the plot image IS committed since the README embeds it)
+*.log
+
+# tooling / env / editor cruft
+.hypothesis/
+.pi/
+.devcontainer/
+.venv/
+.env
+.DS_Store
