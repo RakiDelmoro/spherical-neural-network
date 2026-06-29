@@ -822,6 +822,97 @@ def plot_results(results: list[Result], out_path: str, stream: str) -> None:
     print(f"Plot saved to: {curves_path}", flush=True)
 
 
+# learning-time threshold for the 'time to learn' metric: first epoch at which
+# new-task accuracy reaches this value.
+_LEARN_THRESH = 0.80
+
+
+def _per_run_metrics(run: list[Result], n_tasks: int) -> dict[str, dict[str, float]]:
+    """Compute the three commenter-requested metrics for one run (one seed),
+    per condition. Returns {name: {time_to_learn, learning_gained, memory_lost}}.
+
+    - time_to_learn  : mean over tasks 1..n-1 of the first epoch (1-indexed) at
+                       which new-task accuracy >= _LEARN_THRESH; if a method
+                       never reaches it within the budget, count as n_epochs+1
+                       (i.e. 'did not learn in time'). LOWER = faster learning.
+    - learning_gained: final average accuracy across all tasks. HIGHER = more learned.
+    - memory_lost    : average forgetting. LOWER = less forgotten.
+    """
+    out = {}
+    for r in run:
+        ttls = []
+        for ti in range(1, min(n_tasks, len(r.curves))):
+            rows = r.curves[ti]
+            reached = None
+            for (ep, new_acc, _old) in rows:
+                if new_acc >= _LEARN_THRESH:
+                    reached = ep + 1  # 1-indexed epoch
+                    break
+            ttls.append(reached if reached is not None else (len(rows) + 1))
+        ttl = float(sum(ttls) / len(ttls)) if ttls else float("nan")
+        out[r.name] = {
+            "time_to_learn": ttl,
+            "learning_gained": r.final_avg_accuracy() if len(r.acc_matrix) > 1
+                               else r.acc_matrix[-1][0],
+            "memory_lost": r.avg_forgetting(),
+        }
+    return out
+
+
+def plot_metrics(all_runs: list[list[Result]], out_path: str, stream: str) -> None:
+    """Three dedicated metric bar charts (mean +/- std across seeds), one per
+    quantity the commenter asked for: time to learn, total learning gained,
+    total memory lost. Each chart is one bar per condition, with the
+    no-technique control (naive) on the same axes -> directly comparable."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    n_tasks = max(len(r.acc_matrix) for r in all_runs[0])
+    per_run = [_per_run_metrics(run, n_tasks) for run in all_runs]
+    names = list(per_run[0].keys())
+    colors = {r.name: r.color for r in all_runs[0]}
+
+    def agg(metric: str):
+        vals = {nm: [pr[nm][metric] for pr in per_run] for nm in names}
+        means = [float(np.mean(vals[nm])) for nm in names]
+        stds = [float(np.std(vals[nm])) for nm in names] if len(all_runs) > 1 \
+               else [0.0] * len(names)
+        return means, stds
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5.5))
+    specs = [
+        ("time_to_learn", f"Time to learn\n(mean epochs to reach "
+         f"{int(_LEARN_THRESH*100)}% new-task acc; lower = faster)", "lower is better"),
+        ("learning_gained", "Total learning gained\n(final avg accuracy over all tasks; higher = more)", "higher is better"),
+        ("memory_lost", "Total memory lost\n(avg forgetting; lower = less forgotten)", "lower is better"),
+    ]
+    x = np.arange(len(names))
+    for ax, (metric, title, better) in zip(axes, specs):
+        means, stds = agg(metric)
+        ax.bar(x, means, yerr=stds, capsize=4,
+               color=[colors.get(nm, "#9467bd") for nm in names],
+               alpha=0.85, edgecolor="black", linewidth=0.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels(names, rotation=25, ha="right", fontsize=9)
+        ax.set_title(title, fontsize=10)
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.set_ylabel("epochs" if metric == "time_to_learn" else "accuracy / forgetting")
+        for xi, (m, s) in enumerate(zip(means, stds)):
+            ax.text(xi, m + s + 0.03, f"{m:.2f}",
+                    ha="center", va="bottom", fontsize=8)
+        ax.text(0.98, 0.97, better, transform=ax.transAxes, ha="right", va="top",
+                fontsize=8, color="gray", style="italic")
+    fig.suptitle(f"SAND \u2014 Experiment 1 metrics ({stream}, mean +/- std over "
+                 f"{len(all_runs)} seed(s))\nwith-vs-without: naive is the no-technique control",
+                 fontsize=12, fontweight="bold")
+    fig.tight_layout(rect=[0, 0.02, 1, 0.93])
+    metrics_path = out_path.replace(".png", "-metrics.png")
+    fig.savefig(metrics_path, dpi=130)
+    print(f"Plot saved to: {metrics_path}", flush=True)
+
+
 # --------------------------------------------------------------------------- #
 #  Main                                                                       #
 # --------------------------------------------------------------------------- #
@@ -950,6 +1041,7 @@ def main():
         results = run_one(seeds[0])
         print_summary(results)
         plot_results(results, args.plot, args.stream)
+        plot_metrics([results], args.plot, args.stream)
         return
 
     # ---- multi-seed: run each, aggregate mean±std ----
@@ -1009,6 +1101,7 @@ def main():
 
     # plot the FIRST seed's run as the representative figure
     plot_results(all_runs[0], args.plot, args.stream)
+    plot_metrics(all_runs, args.plot, args.stream)
 
 
 if __name__ == "__main__":
