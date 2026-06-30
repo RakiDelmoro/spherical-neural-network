@@ -97,19 +97,42 @@ report mean ± std so the result isn't a fluke.
 
 ## Result (Experiment 1, varied-MNIST, 3 seeds, fair compute)
 
-![Experiment 1 results](result-exp-1.png)
+### 1. Summary — average accuracy over tasks + final accuracy/forgetting
+
+![Experiment 1 summary](result-exp-1.png)
+
+*Left* — one line per approach = average accuracy over all tasks seen so far,
+vs the number of tasks trained (a method that forgets drops as tasks
+accumulate; SAND/joint stay high). *Right* — final average accuracy (↑ better)
+and average forgetting (↓ better) per condition; the dashed line is `avg fixed`
+= the fair no-lookahead bar.
+
+### 2. Learning curves over time — how fast it learns vs forgets, per epoch
+
+![Learning curves over time](result-exp-1-curves.png)
+
+Per-epoch accuracy as each task is trained. *Top row* = how fast each method
+learns the NEW task (curves rising = learning). *Bottom row* = how much it
+forgets the OLD tasks (curves dropping = forgetting). `naive` (no technique)
+is the control on the same axes — it learns fast but the bottom row craters
+(forgetting); SAND learns fast and the bottom row stays flat (no forgetting).
+
+### 3. Metrics — time to learn, total learning, total memory lost
+
+![Metrics: time to learn / total learning / total memory lost](result-exp-1-metrics.png)
+
+Three dedicated bar charts (mean ± std over seeds), each with the no-technique
+control (`naive`) on the same axes: *time to learn* (epochs to 80% new-task
+accuracy; lower = faster), *total learning gained* (final avg accuracy;
+higher = more), *total memory lost* (avg forgetting; lower = better).
+
+---
 
 SAND reliably beats a blindly-picked fixed direction-LR (the fair bar) and
 matches well-tuned fixed fractions — **without needing per-dataset
 hyperparameter tuning**, and with the lowest variance of any method. It does
 NOT clearly beat the best hindsight-tuned fixed fraction (expected — that
 baseline is tuned with full knowledge of all tasks).
-
-**Reading the plot:** *Left* — one line per approach = average accuracy over
-all tasks seen so far, vs the number of tasks trained (a method that forgets
-drops as tasks accumulate; SAND/joint stay high). *Right* — final average
-accuracy (↑ better) and average forgetting (↓ better) per condition; the
-dashed line is `avg fixed` = the fair no-lookahead bar.
 
 ## Run it
 
@@ -120,7 +143,9 @@ python3 -u run_experiment_1.py
 
 That runs varied-MNIST, shared head, hidden 32, 5 tasks, 4 epochs, 3 seeds,
 fixed fractions {0, 0.4, 1.0}, + naive + SAND + joint, and writes `exp1.log`
-+ `result-exp-1.png`.
+plus three plots: `result-exp-1.png` (summary), `result-exp-1-curves.png`
+(per-epoch learning curves), `result-exp-1-metrics.png` (time-to-learn /
+total-learning / total-memory-lost bars).
 
 Conditions: `naive` (forgetting baseline) · `fixed frac=…` (ablation) ·
 `SAND` (ours) · `joint` (ceiling).
